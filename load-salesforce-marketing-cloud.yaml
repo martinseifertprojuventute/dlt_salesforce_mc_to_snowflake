@@ -1,0 +1,4 @@
+spec:
+  containers:
+    - name: load-salesforce-marketing-cloud
+      image: owhiowe-pj-dlh.registry.snowflakecomputing.com/meta/load/image_repo/load_salesforce_marketing_cloud:latest
