@@ -89,22 +89,21 @@ pip install -r requirements.txt
 3. Configure credentials in `.dlt/secrets.toml`:
 
 ```toml
-[sources.salesforce_marketing_cloud_rest_source]
-subdomain = "mc123456789"
-client_id = "your_client_id"
-client_secret = "your_client_secret"
-
-[sources.salesforce_marketing_cloud_soap_source]
-subdomain = "mc123456789"
-client_id = "your_client_id"
-client_secret = "your_client_secret"
+[sources.load_salesforce_marketing_cloud]
+subdomain = "<my SFMC subdomain>"
+client_id  = "<SFMC client_id>"
+client_secret = "<SFMC client_secret>"
 
 [destination.snowflake.credentials]
-database = "your_database"
-username = "your_username"
-password = "your_password"
-warehouse = "your_warehouse"
-role = "your_role"
+database = "RAW"
+username = "DLT"
+private_key = """-----BEGIN ENCRYPTED PRIVATE KEY-----
+MI...Fj
+-----END ENCRYPTED PRIVATE KEY-----"""
+private_key_passphrase="<m< passphrase>"
+host = "<my Snowflake account identified>"
+warehouse = "WH_DLT"
+role = "SYSADMIN"
 ```
 
 4. Run the pipeline:
