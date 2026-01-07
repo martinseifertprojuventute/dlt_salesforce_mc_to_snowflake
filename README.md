@@ -165,13 +165,13 @@ load_info = pipeline.run(
 
 ```
 .
-├── load_salesforce_marketing_cloud.py  # Main pipeline script
+├── load_salesforce_marketing_cloud.py    # Main pipeline script
 ├── load-salesforce-marketing-cloud.yaml  # SPCS job specification
-├── drop_pipeline.py                    # Utility to reset pipeline state
-├── dockerfile                          # Container image definition
-├── requirements.txt                    # Python dependencies
+├── drop_pipeline.py                      # Utility to reset pipeline state
+├── dockerfile                            # Container image definition
+├── requirements.txt                      # Python dependencies
 ├── .dlt/
-│   └── secrets.toml                   # Credentials (not in repo)
+│   └── secrets.toml                      # Credentials (not in repo)
 └── .gitignore
 ```
 
