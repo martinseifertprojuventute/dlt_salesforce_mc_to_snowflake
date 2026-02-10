@@ -1,10 +1,15 @@
 """Salesforce Marketing Cloud pipeline using both REST and SOAP APIs."""
 
 import dlt
-import requests
+from dlt.pipeline.progress import alive_progress
+import requests as requests_lib
 from typing import Iterator, Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from dlt.sources.rest_api import rest_api_source
+import time
+
+from cryptography.hazmat.primitives import serialization
+import snowflake.connector
 
 
 def get_access_token(subdomain: str, client_id: str, client_secret: str) -> str:
@@ -31,7 +36,7 @@ def get_access_token(subdomain: str, client_id: str, client_secret: str) -> str:
         "Content-Type": "application/json",
     }
 
-    response = requests.post(token_url, json=payload, headers=headers)
+    response = requests_lib.post(token_url, json=payload, headers=headers)
     response.raise_for_status()
 
     token_data = response.json()
@@ -91,9 +96,19 @@ def create_soap_resource(
         # SOAP API endpoint
         wsdl_url = f"https://{subdomain}.soap.marketingcloudapis.com/etframework.wsdl"
 
-        # Create session
+        # Create session with retry adapter for transient HTTP errors
         session = Session()
-        transport = Transport(session=session)
+        from urllib3.util.retry import Retry
+        from requests.adapters import HTTPAdapter
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        transport = Transport(session=session, timeout=120)
 
         if full_load:
             print(f"Fetching all {object_type} objects (full load)...")
@@ -131,9 +146,9 @@ def create_soap_resource(
             def ingress(self, envelope, http_headers, operation):
                 return envelope, http_headers
 
-        # Helper function to execute SOAP request with auto-retry on token expiration
-        def execute_with_retry(client, oauth_plugin, request_func, max_retries=2):
-            """Execute a SOAP request with automatic token refresh on expiration."""
+        # Helper function to execute SOAP request with auto-retry on token expiration and transient errors
+        def execute_with_retry(client, oauth_plugin, request_func, max_retries=3):
+            """Execute a SOAP request with automatic retry on token expiration and connection errors."""
             for attempt in range(max_retries):
                 try:
                     return request_func()
@@ -141,8 +156,15 @@ def create_soap_resource(
                     if 'Token Expired' in str(e) and attempt < max_retries - 1:
                         print(f"Token expired, refreshing... (attempt {attempt + 1}/{max_retries})")
                         oauth_plugin.refresh_token()
-                        # Recreate client with new token
-                        client._binding_options = {}  # Reset binding options
+                        client._binding_options = {}
+                    else:
+                        raise
+                except (requests_lib.ConnectionError, requests_lib.Timeout) as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** (attempt + 1)
+                        print(f"Connection error: {e}. Retrying in {wait}s... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait)
+                        oauth_plugin.refresh_token()
                     else:
                         raise
 
@@ -450,7 +472,7 @@ def salesforce_marketing_cloud_soap_source(
     subdomain: str = dlt.secrets.value,
     client_id: str = dlt.secrets.value,
     client_secret: str = dlt.secrets.value,
-    days_back: int = 4,
+    days_back: int = 28,
 ):
     """
     Salesforce Marketing Cloud SOAP API source with configurable object types.
@@ -497,8 +519,8 @@ def salesforce_marketing_cloud_soap_source(
             'object_type': 'Send',
             'properties': ['ID', 'CreatedDate', 'ModifiedDate', 'Client.ID', 'Email.ID', 'SendDate', 'FromName', 'FromAddress', 'Status', 'Subject', 'EmailName', 'NumberSent', 'NumberDelivered', 'NumberTargeted', 'NumberErrored', 'NumberExcluded', 'PreviewURL'],
             'filter_property': 'CreatedDate',
-            'days_back': days_back,
-            'full_load': False,  # Use date filter
+            'days_back': 999,
+            'full_load': True,  # Could use date filter
             'primary_key': 'id'
         },
         {
@@ -513,7 +535,7 @@ def salesforce_marketing_cloud_soap_source(
             'object_type': 'Subscriber',
             'properties': ['ID', 'SubscriberKey', 'EmailAddress', 'Status', 'CreatedDate', 'EmailTypePreference', 'UnsubscribedDate'],
             'filter_property': None,  # Subscriber doesn't support date filtering via ModifiedDate
-            'days_back': days_back,
+            'days_back': 999,
             'full_load': True,  # Must do full load - Subscriber doesn't support ModifiedDate filter
             'primary_key': 'subscriberkey'  # SubscriberKey is the proper primary key for Subscriber objects
         },
@@ -542,22 +564,48 @@ def salesforce_marketing_cloud_soap_source(
         )
 
 
-pipeline = dlt.pipeline(
-    pipeline_name='salesforce_marketing_cloud_pipeline',
-    destination='snowflake',
-    dataset_name='salesforce_marketing_cloud',
-    # dev_mode=True,            # use separate timestamped schema
-    # refresh="drop_sources"    # drop tables AND reset state for full reload (only needed once)
-)
-
-
 if __name__ == "__main__":
+    pipeline = dlt.pipeline(
+        pipeline_name='salesforce_marketing_cloud_pipeline',
+        destination='snowflake',
+        dataset_name='salesforce_marketing_cloud',
+        # progress=alive_progress(enrich_print=False), # when running locally
+        # dev_mode=True,            # use separate timestamped schema
+        # refresh="drop_sources"    # drop tables AND reset state for full reload (only needed once)
+    )
+
     # Load REST API data (Assets, Campaigns, Journeys)
     print("Loading REST API data...")
-    load_info = pipeline.run(salesforce_marketing_cloud_rest_source())
+    load_info = pipeline.run(salesforce_marketing_cloud_rest_source(), loader_file_format="parquet")
     print(load_info)
 
     # Load SOAP API data (SentEvent, Send, Email)
     print("\nLoading SOAP API data...")
-    load_info = pipeline.run(salesforce_marketing_cloud_soap_source())
+    load_info = pipeline.run(salesforce_marketing_cloud_soap_source(), loader_file_format="parquet")
     print(load_info)
+
+    # Connect to Snowflake and execute downstream refresh task
+    creds = dlt.secrets["destination.snowflake.credentials"]
+    pem_key = serialization.load_pem_private_key(
+        creds["private_key"].encode(),
+        password=creds["private_key_passphrase"].encode(),
+    )
+    pkb = pem_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    conn = snowflake.connector.connect(
+        account=creds["host"],
+        user=creds["username"],
+        private_key=pkb,
+        database=creds["database"],
+        warehouse=creds["warehouse"],
+        role=creds["role"],
+    )
+    try:
+        conn.cursor().execute("EXECUTE TASK RAW.SALESFORCE_MARKETING_CLOUD.TA_REFRESH_DOWNSTREAM;")
+        print("Executed task raw.salesforce_marketing_cloud.ta_refresh_downstream")
+    finally:
+        conn.close()
